@@ -1,0 +1,155 @@
+#!/bin/bash
+
+# Configurações de segurança e erro
+set -eo pipefail
+
+# 1. Garantir privilégios de root (pedir sudo se não for root)
+if [ "$EUID" -ne 0 ]; then
+    echo "Privilégios de root requeridos. Executando com sudo..."
+    exec sudo "$0" "$@"
+fi
+
+# 2. Obter o diretório home do usuário original (mesmo sob sudo)
+if [ -n "$SUDO_USER" ]; then
+    USER_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    USER_HOME="$HOME"
+fi
+
+# 3. Pedir o link do kernel ao usuário
+read -p "Digite o link do arquivo do kernel (.tar.xz ou .tar.gz): " LINK
+if [ -z "$LINK" ]; then
+    echo "Erro: O link não pode ser vazio." >&2
+    exit 1
+fi
+
+# Diretórios e configurações
+MOK_KEY="$USER_HOME/MOK.priv"
+MOK_CERT="$USER_HOME/MOK.pem"
+TEMP_DIR=$(mktemp -d)
+
+# Função de limpeza
+cleanup() {
+    local exit_code=$?
+    rm -rf "$TEMP_DIR"
+    exit $exit_code
+}
+trap cleanup EXIT INT TERM ERR
+
+# 4. Detectar o diretório do kernel anterior antes de descompactar o novo
+echo "Buscando versão do kernel anterior em /opt..."
+PREV_KERNEL_DIR=$(ls -d /opt/linux-* 2>/dev/null | sort -V | tail -n 1 || true)
+if [ -n "$PREV_KERNEL_DIR" ]; then
+    echo "Kernel anterior encontrado: $PREV_KERNEL_DIR"
+else
+    echo "Nenhum diretório de kernel anterior encontrado em /opt."
+fi
+
+# 5. Baixar o arquivo do kernel
+echo "Baixando o arquivo do kernel..."
+if command -v curl >/dev/null 2>&1; then
+    curl -L "$LINK" -o "$TEMP_DIR/archive.tar"
+elif command -v wget >/dev/null 2>&1; then
+    wget -O "$TEMP_DIR/archive.tar" "$LINK"
+else
+    echo "Erro: Instale curl ou wget para continuar." >&2
+    exit 1
+fi
+
+# 6. Descompactar o kernel
+echo "Descompactando o kernel..."
+mkdir -p "$TEMP_DIR/extracted"
+tar -xf "$TEMP_DIR/archive.tar" -C "$TEMP_DIR/extracted"
+
+# Encontrar o diretório extraído
+EXTRACTED_FOLDER=$(find "$TEMP_DIR/extracted" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+if [ -z "$EXTRACTED_FOLDER" ]; then
+    echo "Erro: Pasta do kernel não encontrada no arquivo descompactado." >&2
+    exit 1
+fi
+
+FOLDER_NAME=$(basename "$EXTRACTED_FOLDER")
+TARGET_DIR="/opt/$FOLDER_NAME"
+
+# Se o diretório de destino já existir, criar backup
+if [ -d "$TARGET_DIR" ]; then
+    BACKUP_PATH="${TARGET_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+    echo "Aviso: O diretório $TARGET_DIR já existe. Movendo antigo para $BACKUP_PATH..."
+    mv "$TARGET_DIR" "$BACKUP_PATH"
+fi
+
+# Mover o diretório extraído para /opt
+echo "Instalando código fonte do kernel em $TARGET_DIR..."
+mv "$EXTRACTED_FOLDER" "$TARGET_DIR"
+
+# 7. Copiar o .config do diretório anterior
+if [ -n "$PREV_KERNEL_DIR" ] && [ -f "$PREV_KERNEL_DIR/.config" ]; then
+    echo "Copiando .config de: $PREV_KERNEL_DIR"
+    cp "$PREV_KERNEL_DIR/.config" "$TARGET_DIR/.config"
+elif [ -f "/boot/config-$(uname -r)" ]; then
+    echo "Aviso: .config não encontrado em $PREV_KERNEL_DIR. Copiando configuração do kernel em execução (/boot/config-$(uname -r))..."
+    cp "/boot/config-$(uname -r)" "$TARGET_DIR/.config"
+else
+    echo "Aviso: Nenhum arquivo .config anterior encontrado."
+fi
+
+# 8. Entrar no diretório do novo kernel para compilação e instalação
+cd "$TARGET_DIR"
+
+# Detectar a versão do kernel
+VERSION=$(make -s kernelversion 2>/dev/null || echo "${FOLDER_NAME#linux-}")
+echo "Versão do kernel identificada: $VERSION"
+
+# Se não houver .config (por ex. nova instalação sem histórico), inicializa com a padrão do sistema
+if [ ! -f ".config" ]; then
+    echo "Inicializando configuração padrão (defconfig)..."
+    make defconfig
+fi
+
+# 9. Executar os comandos de configuração e compilação
+echo "Preparando a configuração local baseada nos módulos ativos (make localmodconfig)..."
+make localmodconfig
+
+echo "Compilando o kernel (make -j\$(nproc))..."
+make -j$(nproc)
+
+echo "Instalando módulos do kernel..."
+make modules_install
+
+echo "Instalando o kernel..."
+make install
+
+# 10. Atualizar initramfs e gerenciador de boot
+echo "Atualizando initramfs para a versão $VERSION..."
+update-initramfs -c -k "$VERSION"
+
+echo "Atualizando o menu do GRUB..."
+update-grub
+
+# 11. Assinatura do Kernel para Secure Boot
+echo "Iniciando assinatura do kernel para Secure Boot..."
+if [ -f "$MOK_KEY" ] && [ -f "$MOK_CERT" ]; then
+    VMLINUZ_FILE="/boot/vmlinuz-$VERSION"
+    if [ ! -f "$VMLINUZ_FILE" ]; then
+        # Procurar por variações do nome do kernel gerado no /boot
+        local found_files=(/boot/vmlinuz-*"$VERSION"*)
+        if [ -f "${found_files[0]}" ]; then
+            VMLINUZ_FILE="${found_files[0]}"
+        fi
+    fi
+
+    if [ -f "$VMLINUZ_FILE" ]; then
+        echo "Assinando o arquivo: $VMLINUZ_FILE"
+        sbsign --key "$MOK_KEY" --cert "$MOK_CERT" "$VMLINUZ_FILE" --output "$VMLINUZ_FILE"
+        echo "Kernel assinado com sucesso!"
+    else
+        echo "Erro: Arquivo do kernel correspondente a $VERSION não encontrado em /boot." >&2
+        exit 1
+    fi
+else
+    echo "Erro: Chave MOK ($MOK_KEY) ou certificado ($MOK_CERT) não encontrado." >&2
+    echo "Por favor, garanta que MOK.priv e MOK.pem estão no diretório home do seu usuário original." >&2
+    exit 1
+fi
+
+echo "Atualização e instalação do kernel concluídas com sucesso!"
