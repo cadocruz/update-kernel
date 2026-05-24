@@ -16,6 +16,30 @@ else
     USER_HOME="$HOME"
 fi
 
+# Variáveis de controle
+ONLY_COMPILE=false
+TARGET_DIR=""
+LINK=""
+
+# Parse de argumentos
+while [[ "$#" -gt 0 ]]; do
+    case "$1" in
+        -c|--only-compile|--compile)
+            ONLY_COMPILE=true
+            if [[ -n "$2" && "$2" != -* ]]; then
+                TARGET_DIR="$2"
+                shift
+            fi
+            ;;
+        *)
+            echo "Opção desconhecida: $1" >&2
+            echo "Uso: $0 [-c|--only-compile] [/opt/linux-version]" >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 # Função para obter a URL da versão estável mais recente do kernel.org
 get_latest_stable_url() {
     local json
@@ -49,150 +73,226 @@ except Exception:
     echo "$json" | grep -oP '"moniker":\s*"stable".*?"source":\s*"\K[^"]+' | head -n 1
 }
 
-# 3. Obter o link do kernel (automático ou manual)
-echo "Buscando informações da versão estável mais recente no kernel.org..."
-LATEST_URL=$(get_latest_stable_url || true)
+# Se não foi forçado o modo de apenas compilar por argumento, oferece menu interativo
+if [ "$ONLY_COMPILE" = false ]; then
+    echo "=== Assistente de Instalação e Compilação do Kernel Linux ==="
+    echo "Selecione uma opção:"
+    echo "1) Baixar e instalar a versão estável mais recente do kernel.org"
+    echo "2) Baixar e instalar a partir de um link personalizado"
+    echo "3) Apenas compilar e instalar a partir de um diretório existente em /opt"
+    read -p "Opção (padrão: 1): " OPTION
+    
+    case "$OPTION" in
+        2)
+            read -p "Digite o link do arquivo do kernel (.tar.xz ou .tar.gz): " LINK
+            if [ -z "$LINK" ]; then
+                echo "Erro: O link não pode ser vazio." >&2
+                exit 1
+            fi
+            ;;
+        3)
+            ONLY_COMPILE=true
+            ;;
+        *)
+            # Padrão: Opção 1, vamos buscar o link automático mais tarde
+            ;;
+    esac
+fi
 
-if [ -n "$LATEST_URL" ]; then
-    LATEST_VERSION=$(basename "$LATEST_URL" | sed -r 's/linux-(.+)\.tar\.(xz|gz)/\1/')
-    echo "Versão estável mais recente detectada: $LATEST_VERSION"
-    echo "Link: $LATEST_URL"
-    
-    if [ -d "/opt/linux-$LATEST_VERSION" ]; then
-        echo "Aviso: A versão $LATEST_VERSION já está descompactada em /opt/linux-$LATEST_VERSION."
+# Resolução do diretório para compilação caso esteja no modo apenas compilar
+if [ "$ONLY_COMPILE" = true ]; then
+    if [ -z "$TARGET_DIR" ]; then
+        echo "Buscando diretórios do kernel disponíveis em /opt..."
+        shopt -s nullglob
+        dirs=(/opt/linux-*)
+        shopt -u nullglob
+        
+        if [ ${#dirs[@]} -eq 0 ]; then
+            echo "Erro: Nenhum diretório de kernel (/opt/linux-*) encontrado em /opt." >&2
+            exit 1
+        fi
+        
+        echo "Selecione o diretório do kernel para compilar:"
+        for i in "${!dirs[@]}"; do
+            echo "$((i+1))) ${dirs[i]}"
+        done
+        
+        read -p "Escolha o número: " choice
+        if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#dirs[@]}" ]; then
+            TARGET_DIR="${dirs[$((choice-1))]}"
+        else
+            echo "Erro: Escolha inválida." >&2
+            exit 1
+        fi
     fi
     
-    read -p "Pressione Enter para prosseguir com a versão $LATEST_VERSION, digite 'n' para cancelar ou cole um link personalizado: " USER_INPUT
-    
-    if [ -z "$USER_INPUT" ] || [ "$USER_INPUT" = "s" ] || [ "$USER_INPUT" = "S" ]; then
-        LINK="$LATEST_URL"
-    elif [ "$USER_INPUT" = "n" ] || [ "$USER_INPUT" = "N" ]; then
-        echo "Cancelado pelo usuário."
-        exit 0
-    elif [[ "$USER_INPUT" =~ ^https?:// ]]; then
-        LINK="$USER_INPUT"
-    else
-        echo "Erro: Entrada inválida." >&2
-        exit 1
-    fi
-else
-    echo "Aviso: Não foi possível obter informações do kernel.org de forma automática."
-    read -p "Digite o link do arquivo do kernel (.tar.xz ou .tar.gz) manualmente: " LINK
-    if [ -z "$LINK" ]; then
-        echo "Erro: O link não pode ser vazio." >&2
+    if [ ! -d "$TARGET_DIR" ]; then
+        echo "Erro: O diretório '$TARGET_DIR' não existe." >&2
         exit 1
     fi
 fi
 
-# Diretórios e configurações
+# Chaves MOK
 MOK_KEY="$USER_HOME/MOK.priv"
 MOK_CERT="$USER_HOME/MOK.pem"
-TEMP_DIR=$(mktemp -d)
 
-# Função de limpeza
-cleanup() {
-    local exit_code=$?
-    rm -rf "$TEMP_DIR"
-    exit $exit_code
-}
-trap cleanup EXIT INT TERM ERR
+# Se NÃO estiver no modo apenas compilar, realizar download e preparação
+if [ "$ONLY_COMPILE" = false ]; then
+    # Se a opção 1 foi selecionada (ou padrão) e LINK ainda não foi definido
+    if [ -z "$LINK" ]; then
+        echo "Buscando informações da versão estável mais recente no kernel.org..."
+        LATEST_URL=$(get_latest_stable_url || true)
+        
+        if [ -n "$LATEST_URL" ]; then
+            LATEST_VERSION=$(basename "$LATEST_URL" | sed -r 's/linux-(.+)\.tar\.(xz|gz)/\1/')
+            echo "Versão estável mais recente detectada: $LATEST_VERSION"
+            echo "Link: $LATEST_URL"
+            
+            if [ -d "/opt/linux-$LATEST_VERSION" ]; then
+                echo "Aviso: A versão $LATEST_VERSION já está descompactada em /opt/linux-$LATEST_VERSION."
+            fi
+            
+            read -p "Pressione Enter para prosseguir com a versão $LATEST_VERSION, digite 'n' para cancelar ou cole um link personalizado: " USER_INPUT
+            
+            if [ -z "$USER_INPUT" ] || [ "$USER_INPUT" = "s" ] || [ "$USER_INPUT" = "S" ]; then
+                LINK="$LATEST_URL"
+            elif [ "$USER_INPUT" = "n" ] || [ "$USER_INPUT" = "N" ]; then
+                echo "Cancelado pelo usuário."
+                exit 0
+            elif [[ "$USER_INPUT" =~ ^https?:// ]]; then
+                LINK="$USER_INPUT"
+            else
+                echo "Erro: Entrada inválida." >&2
+                exit 1
+            fi
+        else
+            echo "Aviso: Não foi possível obter informações do kernel.org de forma automática."
+            read -p "Digite o link do arquivo do kernel (.tar.xz ou .tar.gz) manualmente: " LINK
+            if [ -z "$LINK" ]; then
+                echo "Erro: O link não pode ser vazio." >&2
+                exit 1
+            fi
+        fi
+    fi
 
-# 4. Detectar o diretório do kernel anterior antes de descompactar o novo
-echo "Buscando versão do kernel anterior em /opt..."
-PREV_KERNEL_DIR=$(ls -d /opt/linux-* 2>/dev/null | sort -V | tail -n 1 || true)
-if [ -n "$PREV_KERNEL_DIR" ]; then
-    echo "Kernel anterior encontrado: $PREV_KERNEL_DIR"
-else
-    echo "Nenhum diretório de kernel anterior encontrado em /opt."
+    # Preparar diretório temporário para download/descompressão
+    TEMP_DIR=$(mktemp -d)
+    cleanup() {
+        local exit_code=$?
+        rm -rf "$TEMP_DIR"
+        exit $exit_code
+    }
+    trap cleanup EXIT INT TERM ERR
+
+    # Detectar o diretório do kernel anterior antes de descompactar o novo
+    echo "Buscando versão do kernel anterior em /opt..."
+    PREV_KERNEL_DIR=$(ls -d /opt/linux-* 2>/dev/null | sort -V | tail -n 1 || true)
+    if [ -n "$PREV_KERNEL_DIR" ]; then
+        echo "Kernel anterior encontrado: $PREV_KERNEL_DIR"
+    else
+        echo "Nenhum diretório de kernel anterior encontrado em /opt."
+    fi
+
+    # Baixar
+    echo "Baixando o arquivo do kernel de $LINK..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -L "$LINK" -o "$TEMP_DIR/archive.tar"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -O "$TEMP_DIR/archive.tar" "$LINK"
+    else
+        echo "Erro: Instale curl ou wget para continuar." >&2
+        exit 1
+    fi
+
+    # Descompactar
+    echo "Descompactando o kernel..."
+    mkdir -p "$TEMP_DIR/extracted"
+    tar -xf "$TEMP_DIR/archive.tar" -C "$TEMP_DIR/extracted"
+
+    EXTRACTED_FOLDER=$(find "$TEMP_DIR/extracted" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    if [ -z "$EXTRACTED_FOLDER" ]; then
+        echo "Erro: Pasta do kernel não encontrada no arquivo descompactado." >&2
+        exit 1
+    fi
+
+    FOLDER_NAME=$(basename "$EXTRACTED_FOLDER")
+    TARGET_DIR="/opt/$FOLDER_NAME"
+
+    # Se o diretório de destino já existir, criar backup
+    if [ -d "$TARGET_DIR" ]; then
+        BACKUP_PATH="${TARGET_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+        echo "Aviso: O diretório $TARGET_DIR já existe. Movendo antigo para $BACKUP_PATH..."
+        mv "$TARGET_DIR" "$BACKUP_PATH"
+    fi
+
+    # Mover para /opt
+    echo "Instalando código fonte do kernel em $TARGET_DIR..."
+    mv "$EXTRACTED_FOLDER" "$TARGET_DIR"
+
+    # Copiar o .config
+    if [ -n "$PREV_KERNEL_DIR" ] && [ -f "$PREV_KERNEL_DIR/.config" ]; then
+        echo "Copiando .config de: $PREV_KERNEL_DIR"
+        cp "$PREV_KERNEL_DIR/.config" "$TARGET_DIR/.config"
+    elif [ -f "/boot/config-$(uname -r)" ]; then
+        echo "Aviso: .config não encontrado em $PREV_KERNEL_DIR. Copiando configuração do kernel em execução (/boot/config-$(uname -r))...."
+        cp "/boot/config-$(uname -r)" "$TARGET_DIR/.config"
+    else
+        echo "Aviso: Nenhum arquivo .config anterior encontrado."
+    fi
 fi
 
-# 5. Baixar o arquivo do kernel
-echo "Baixando o arquivo do kernel de $LINK..."
-if command -v curl >/dev/null 2>&1; then
-    curl -L "$LINK" -o "$TEMP_DIR/archive.tar"
-elif command -v wget >/dev/null 2>&1; then
-    wget -O "$TEMP_DIR/archive.tar" "$LINK"
-else
-    echo "Erro: Instale curl ou wget para continuar." >&2
-    exit 1
-fi
-
-# 6. Descompactar o kernel
-echo "Descompactando o kernel..."
-mkdir -p "$TEMP_DIR/extracted"
-tar -xf "$TEMP_DIR/archive.tar" -C "$TEMP_DIR/extracted"
-
-# Encontrar o diretório extraído
-EXTRACTED_FOLDER=$(find "$TEMP_DIR/extracted" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-if [ -z "$EXTRACTED_FOLDER" ]; then
-    echo "Erro: Pasta do kernel não encontrada no arquivo descompactado." >&2
-    exit 1
-fi
-
-FOLDER_NAME=$(basename "$EXTRACTED_FOLDER")
-TARGET_DIR="/opt/$FOLDER_NAME"
-
-# Se o diretório de destino já existir, criar backup
-if [ -d "$TARGET_DIR" ]; then
-    BACKUP_PATH="${TARGET_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-    echo "Aviso: O diretório $TARGET_DIR já existe. Movendo antigo para $BACKUP_PATH..."
-    mv "$TARGET_DIR" "$BACKUP_PATH"
-fi
-
-# Mover o diretório extraído para /opt
-echo "Instalando código fonte do kernel em $TARGET_DIR..."
-mv "$EXTRACTED_FOLDER" "$TARGET_DIR"
-
-# 7. Copiar o .config do diretório anterior
-if [ -n "$PREV_KERNEL_DIR" ] && [ -f "$PREV_KERNEL_DIR/.config" ]; then
-    echo "Copiando .config de: $PREV_KERNEL_DIR"
-    cp "$PREV_KERNEL_DIR/.config" "$TARGET_DIR/.config"
-elif [ -f "/boot/config-$(uname -r)" ]; then
-    echo "Aviso: .config não encontrado em $PREV_KERNEL_DIR. Copiando configuração do kernel em execução (/boot/config-$(uname -r))..."
-    cp "/boot/config-$(uname -r)" "$TARGET_DIR/.config"
-else
-    echo "Aviso: Nenhum arquivo .config anterior encontrado."
-fi
-
-# 8. Entrar no diretório do novo kernel para compilação e instalação
+# --- Execução comum (Entrar no diretório e realizar compilação/instalação) ---
 cd "$TARGET_DIR"
 
-# Detectar a versão do kernel
-VERSION=$(make -s kernelversion 2>/dev/null || echo "${FOLDER_NAME#linux-}")
-echo "Versão do kernel identificada: $VERSION"
+# Detectar versão do kernel
+VERSION=$(make -s kernelversion 2>/dev/null || echo "$(basename "$TARGET_DIR" | sed 's/linux-//')")
+echo "Iniciando processo de compilação para o kernel versão: $VERSION (Diretório: $TARGET_DIR)"
 
-# Se não houver .config (por ex. nova instalação sem histórico), inicializa com a padrão do sistema
-if [ ! -f ".config" ]; then
-    echo "Inicializando configuração padrão (defconfig)..."
-    make defconfig
+# Se não estiver no modo apenas compilar e não houver .config, gera padrão
+if [ "$ONLY_COMPILE" = false ]; then
+    if [ ! -f ".config" ]; then
+        echo "Inicializando configuração padrão (defconfig)..."
+        make defconfig
+    fi
+    
+    echo "Preparando a configuração local baseada nos módulos ativos (make localmodconfig)..."
+    make localmodconfig
+else
+    # No modo apenas compilar, garante que exista um .config
+    if [ ! -f ".config" ]; then
+        echo "Erro: Nenhum arquivo .config encontrado em $TARGET_DIR." >&2
+        echo "Por favor, configure o kernel antes de rodar a compilação (ex: make menuconfig)." >&2
+        exit 1
+    fi
 fi
 
-# 9. Executar os comandos de configuração e compilação
-echo "Preparando a configuração local baseada nos módulos ativos (make localmodconfig)..."
-make localmodconfig
-
+# Compilar
 echo "Compilando o kernel (make -j\$(nproc))..."
 make -j$(nproc)
 
+# Instalar módulos e kernel
 echo "Instalando módulos do kernel..."
 make modules_install
 
 echo "Instalando o kernel..."
 make install
 
-# 10. Atualizar initramfs e gerenciador de boot
+# Atualizar initramfs
+echo "Preparando a atualização de initramfs..."
+# Deleta o arquivo antigo se existir, para evitar erro de "Já existe" ao rodar com -c
+rm -f "/boot/initrd.img-$VERSION" "/boot/initramfs-$VERSION.img" 2>/dev/null || true
 echo "Atualizando initramfs para a versão $VERSION..."
 update-initramfs -c -k "$VERSION"
 
+# Atualizar GRUB
 echo "Atualizando o menu do GRUB..."
 update-grub
 
-# 11. Assinatura do Kernel para Secure Boot
+# Assinatura do Kernel para Secure Boot
 echo "Iniciando assinatura do kernel para Secure Boot..."
 if [ -f "$MOK_KEY" ] && [ -f "$MOK_CERT" ]; then
     VMLINUZ_FILE="/boot/vmlinuz-$VERSION"
     if [ ! -f "$VMLINUZ_FILE" ]; then
-        # Procurar por variações do nome do kernel gerado no /boot
         local found_files=(/boot/vmlinuz-*"$VERSION"*)
         if [ -f "${found_files[0]}" ]; then
             VMLINUZ_FILE="${found_files[0]}"
@@ -213,4 +313,4 @@ else
     exit 1
 fi
 
-echo "Atualização e instalação do kernel concluídas com sucesso!"
+echo "Processo concluído com sucesso para a versão $VERSION!"
